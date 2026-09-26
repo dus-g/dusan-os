@@ -1,0 +1,688 @@
+// DUSAN OS — database schema
+// Conventions:
+//   * Money is stored as integer cents (Int) to avoid floating-point drift over 10+ years.
+//   * Calendar days are stored as @db.Date (no time zone). Shift times are minutes-of-day,
+//     so Adelaide daylight-saving changes never corrupt historical hours.
+//   * Every row is owned by a User and cascades on account deletion.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  image        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  settings          Settings?
+  resetTokens       PasswordResetToken[]
+  payRates          PayRate[]
+  shifts            Shift[]
+  paydays           Payday[]
+  accounts          Account[]
+  transactions      Transaction[]
+  categories        Category[]
+  expenses          Expense[]
+  budgets           Budget[]
+  goals             Goal[]
+  goalContributions GoalContribution[]
+  missions          Mission[]
+  xpEvents          XpEvent[]
+  achievements      Achievement[]
+  habits            Habit[]
+  habitLogs         HabitLog[]
+  healthLogs        HealthLog[]
+  measurements      Measurement[]
+  journalEntries    JournalEntry[]
+  programs          UniversityProgram[]
+  semesters         Semester[]
+  subjects          Subject[]
+  assessments       Assessment[]
+  gamsatAttempts    GamsatAttempt[]
+  medApplications   MedApplication[]
+  requirements      EntryRequirement[]
+  lifeEvents        LifeEvent[]
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum TaxMode {
+  ATO_RESIDENT // progressive resident rates + Medicare levy + LITO
+  FLAT         // user-defined flat percentage
+}
+
+model Settings {
+  id                     String   @id @default(cuid())
+  userId                 String   @unique
+  dateOfBirth            DateTime @db.Date
+  timezone               String   @default("Australia/Adelaide")
+  currency               String   @default("AUD")
+  theme                  String   @default("dark")
+  paydayWeekday          Int      @default(4) // 0=Sun … 4=Thu
+  weekStartsOn           Int      @default(1) // Monday
+  taxMode                TaxMode  @default(ATO_RESIDENT)
+  flatTaxRate            Float    @default(0.19)
+  claimTaxFreeThreshold  Boolean  @default(true)
+  superRate              Float    @default(0.12)
+  hasStudyLoan           Boolean  @default(false)
+  universityStartDate    DateTime @db.Date
+  missionCategories      String[] @default(["Money", "Work", "Education", "Health", "Personal", "Career"])
+  mainMissionId          String?
+  updatedAt              DateTime @updatedAt
+  user                   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ───────────────────────────── Work ─────────────────────────────
+
+enum EmploymentType {
+  CASUAL
+  PART_TIME
+  FULL_TIME
+  CONTRACT
+}
+
+enum ShiftType {
+  STANDARD
+  SATURDAY
+  SUNDAY
+  PUBLIC_HOLIDAY
+}
+
+/// A pay profile. Rates are cents per hour.
+model PayRate {
+  id                    String         @id @default(cuid())
+  userId                String
+  name                  String
+  employer              String
+  role                  String
+  employmentType        EmploymentType @default(CASUAL)
+  baseRateCents         Int
+  saturdayRateCents     Int? // null = paid at base rate
+  sundayRateCents       Int
+  publicHolidayRateCents Int
+  overtime1RateCents    Int // first N overtime hours
+  overtime2RateCents    Int // after N overtime hours
+  overtimeAfterMinutes  Int            @default(456) // 7.6h ordinary hours per day
+  overtimeTier1Minutes  Int            @default(180) // first 3 overtime hours
+  isDefault             Boolean        @default(false)
+  active                Boolean        @default(true)
+  startDate             DateTime?      @db.Date
+  endDate               DateTime?      @db.Date
+  createdAt             DateTime       @default(now())
+  user                  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shifts                Shift[]
+
+  @@index([userId])
+}
+
+/// Computed pay values are snapshotted at save time so historical shifts
+/// never change when a pay rate is edited years later.
+model Shift {
+  id              String    @id @default(cuid())
+  userId          String
+  payRateId       String
+  date            DateTime  @db.Date
+  startMinute     Int // minutes after midnight
+  endMinute       Int // may be < startMinute for overnight shifts
+  breakMinutes    Int       @default(30)
+  shiftType       ShiftType @default(STANDARD)
+  location        String?
+  notes           String?
+  totalMinutes    Int
+  regularMinutes  Int
+  overtimeMinutes Int
+  grossCents      Int
+  ordinaryCents   Int // earnings excluding overtime (super applies to OTE)
+  taxCents        Int
+  netCents        Int
+  superCents      Int
+  paydayId        String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  payRate         PayRate   @relation(fields: [payRateId], references: [id], onDelete: Restrict)
+  payday          Payday?   @relation(fields: [paydayId], references: [id], onDelete: SetNull)
+
+  @@index([userId, date])
+}
+
+model Payday {
+  id           String   @id @default(cuid())
+  userId       String
+  payDate      DateTime @db.Date
+  periodStart  DateTime @db.Date
+  periodEnd    DateTime @db.Date
+  minutes      Int
+  grossCents   Int
+  taxCents     Int
+  netCents     Int
+  superCents   Int
+  savedCents   Int      @default(0)
+  notes        String?
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shifts       Shift[]
+  transactions Transaction[]
+
+  @@unique([userId, payDate])
+  @@index([userId, payDate])
+}
+
+// ───────────────────────────── Money ─────────────────────────────
+
+enum AccountType {
+  EVERYDAY
+  SAVINGS
+  EMERGENCY
+  UNIVERSITY
+  INVESTMENT
+  HOME_DEPOSIT
+  OTHER
+  LIABILITY // e.g. HECS-HELP debt; balance stored as a positive amount owed
+}
+
+model Account {
+  id               String        @id @default(cuid())
+  userId           String
+  name             String
+  type             AccountType
+  institution      String?
+  balanceCents     Int           @default(0)
+  countsAsSavings  Boolean       @default(true)
+  color            String        @default("#4FB3B0")
+  order            Int           @default(0)
+  archived         Boolean       @default(false)
+  createdAt        DateTime      @default(now())
+  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions     Transaction[]
+  expenses         Expense[]
+  goals            Goal[]
+
+  @@index([userId])
+}
+
+enum TransactionType {
+  OPENING
+  DEPOSIT
+  WITHDRAWAL
+  TRANSFER_IN
+  TRANSFER_OUT
+  ADJUSTMENT
+  INCOME
+  EXPENSE
+}
+
+/// Every balance change is a transaction, so any account's history can be rebuilt.
+model Transaction {
+  id              String          @id @default(cuid())
+  userId          String
+  accountId       String
+  date            DateTime        @db.Date
+  type            TransactionType
+  amountCents     Int // signed: + increases balance, − decreases
+  description     String
+  transferGroupId String?
+  expenseId       String?         @unique
+  paydayId        String?
+  createdAt       DateTime        @default(now())
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account         Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  expense         Expense?        @relation(fields: [expenseId], references: [id], onDelete: SetNull)
+  payday          Payday?         @relation(fields: [paydayId], references: [id], onDelete: SetNull)
+
+  @@index([userId, date])
+  @@index([accountId, date])
+}
+
+model Category {
+  id        String    @id @default(cuid())
+  userId    String
+  name      String
+  color     String    @default("#8C95A8")
+  isDefault Boolean   @default(false)
+  archived  Boolean   @default(false)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expenses  Expense[]
+  budget    Budget?
+
+  @@unique([userId, name])
+}
+
+model Expense {
+  id          String       @id @default(cuid())
+  userId      String
+  categoryId  String
+  accountId   String?
+  date        DateTime     @db.Date
+  description String
+  amountCents Int
+  notes       String?
+  createdAt   DateTime     @default(now())
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category    Category     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  account     Account?     @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  transaction Transaction?
+
+  @@index([userId, date])
+}
+
+enum BudgetPeriod {
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+model Budget {
+  id          String       @id @default(cuid())
+  userId      String
+  categoryId  String       @unique
+  amountCents Int
+  period      BudgetPeriod @default(WEEKLY)
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category    Category     @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Goal {
+  id                String             @id @default(cuid())
+  userId            String
+  name              String
+  targetCents       Int
+  /// When true, progress = total savings across all savings accounts.
+  trackTotalSavings Boolean            @default(false)
+  /// When set, progress = that account's balance.
+  accountId         String?
+  deadline          DateTime?          @db.Date
+  achievedAt        DateTime?
+  order             Int                @default(0)
+  createdAt         DateTime           @default(now())
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account           Account?           @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  contributions     GoalContribution[]
+
+  @@index([userId])
+}
+
+model GoalContribution {
+  id          String   @id @default(cuid())
+  userId      String
+  goalId      String
+  date        DateTime @db.Date
+  amountCents Int
+  note        String?
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  goal        Goal     @relation(fields: [goalId], references: [id], onDelete: Cascade)
+
+  @@index([goalId, date])
+}
+
+// ───────────────────────────── Life RPG ─────────────────────────────
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+  EPIC
+}
+
+enum MissionStatus {
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+}
+
+/// Auto-tracked missions compute progress from live data.
+enum MissionMetric {
+  MANUAL
+  SAVINGS_TOTAL   // target in cents
+  HOURS_WORKED    // target in hours
+  SHIFTS_COUNT
+  DAYS_EMPLOYED   // days since first shift
+  UNI_STARTED     // target 1
+}
+
+model Mission {
+  id           String        @id @default(cuid())
+  userId       String
+  title        String
+  description  String?
+  category     String
+  priority     Priority      @default(MEDIUM)
+  difficulty   Difficulty    @default(MEDIUM)
+  xpReward     Int           @default(100)
+  deadline     DateTime?     @db.Date
+  status       MissionStatus @default(ACTIVE)
+  metric       MissionMetric @default(MANUAL)
+  metricTarget Float?
+  progress     Int           @default(0) // 0–100 for manual missions
+  completedAt  DateTime?
+  order        Int           @default(0)
+  createdAt    DateTime      @default(now())
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+}
+
+enum XpSource {
+  WORK
+  SAVINGS
+  HEALTH
+  STUDY
+  UNIVERSITY
+  MISSION
+  HABIT
+  JOURNAL
+  ACHIEVEMENT
+}
+
+/// Append-only XP ledger. Level is always derived from the sum.
+model XpEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  source    XpSource
+  amount    Int
+  reason    String
+  refId     String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, refId])
+}
+
+/// Unlocked achievements. Definitions live in src/lib/achievements.ts.
+model Achievement {
+  id         String   @id @default(cuid())
+  userId     String
+  key        String
+  unlockedAt DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+}
+
+// ───────────────────────────── Habits & health ─────────────────────────────
+
+model Habit {
+  id            String     @id @default(cuid())
+  userId        String
+  name          String
+  category      String     @default("Personal")
+  color         String     @default("#4FB3B0")
+  targetPerWeek Int        @default(7)
+  unit          String? // e.g. "min", "pages", "L"
+  archived      Boolean    @default(false)
+  order         Int        @default(0)
+  createdAt     DateTime   @default(now())
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  logs          HabitLog[]
+
+  @@index([userId])
+}
+
+model HabitLog {
+  id      String   @id @default(cuid())
+  userId  String
+  habitId String
+  date    DateTime @db.Date
+  value   Float    @default(1)
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  habit   Habit    @relation(fields: [habitId], references: [id], onDelete: Cascade)
+
+  @@unique([habitId, date])
+  @@index([userId, date])
+}
+
+model HealthLog {
+  id          String   @id @default(cuid())
+  userId      String
+  date        DateTime @db.Date
+  weightKg    Float?
+  sleepHours  Float?
+  waterMl     Int?
+  steps       Int?
+  gymSession  Boolean  @default(false)
+  notes       String?
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+}
+
+model Measurement {
+  id     String   @id @default(cuid())
+  userId String
+  date   DateTime @db.Date
+  kind   String // Waist, Chest, Arm, Thigh, Hips, Body fat…
+  value  Float
+  unit   String   @default("cm")
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, kind, date])
+}
+
+// ───────────────────────────── Journal ─────────────────────────────
+
+enum JournalType {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+model JournalEntry {
+  id           String      @id @default(cuid())
+  userId       String
+  type         JournalType @default(DAILY)
+  date         DateTime    @db.Date // start of the period
+  mood         Int? // 1–5
+  wentWell     String?
+  learned      String?
+  improve      String?
+  tomorrowGoal String?
+  body         String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, type, date])
+  @@index([userId, date])
+}
+
+// ───────────────────────────── Education ─────────────────────────────
+
+enum ProgramKind {
+  BACHELOR
+  MEDICINE
+  OTHER
+}
+
+enum ProgramStatus {
+  PLANNED
+  ACTIVE
+  COMPLETED
+  DEFERRED
+}
+
+model UniversityProgram {
+  id              String        @id @default(cuid())
+  userId          String
+  kind            ProgramKind
+  name            String
+  institution     String
+  startDate       DateTime      @db.Date
+  durationYears   Float
+  annualCostCents Int
+  totalUnits      Float // Flinders: 36 units per full-time year
+  status          ProgramStatus @default(PLANNED)
+  notes           String?
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  semesters       Semester[]
+
+  @@index([userId])
+}
+
+model Semester {
+  id        String            @id @default(cuid())
+  userId    String
+  programId String
+  name      String // "2027 Semester 1"
+  year      Int
+  term      Int
+  startDate DateTime?         @db.Date
+  endDate   DateTime?         @db.Date
+  completed Boolean           @default(false)
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  program   UniversityProgram @relation(fields: [programId], references: [id], onDelete: Cascade)
+  subjects  Subject[]
+
+  @@index([programId])
+}
+
+enum SubjectStatus {
+  ENROLLED
+  PASSED
+  FAILED
+  WITHDRAWN
+}
+
+model Subject {
+  id          String        @id @default(cuid())
+  userId      String
+  semesterId  String
+  code        String // e.g. PHCA1001
+  name        String
+  units       Float         @default(4.5)
+  grade       String? // HD, DN, CR, P, NGP, F
+  mark        Float?
+  status      SubjectStatus @default(ENROLLED)
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  semester    Semester      @relation(fields: [semesterId], references: [id], onDelete: Cascade)
+  assessments Assessment[]
+
+  @@index([semesterId])
+}
+
+enum AssessmentKind {
+  ASSIGNMENT
+  EXAM
+  QUIZ
+  PRACTICAL
+  PRESENTATION
+  OTHER
+}
+
+model Assessment {
+  id        String         @id @default(cuid())
+  userId    String
+  subjectId String
+  title     String
+  kind      AssessmentKind @default(ASSIGNMENT)
+  dueDate   DateTime?      @db.Date
+  weight    Float? // percent of subject
+  mark      Float?
+  maxMark   Float?
+  completed Boolean        @default(false)
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject   Subject        @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@index([userId, dueDate])
+}
+
+model GamsatAttempt {
+  id       String   @id @default(cuid())
+  userId   String
+  sitting  DateTime @db.Date
+  section1 Int?
+  section2 Int?
+  section3 Int?
+  overall  Float? // (S1 + S2 + 2×S3) / 4
+  notes    String?
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum ApplicationStatus {
+  RESEARCHING
+  PREPARING
+  SUBMITTED
+  INTERVIEW
+  OFFER
+  ACCEPTED
+  REJECTED
+  WAITLISTED
+}
+
+model MedApplication {
+  id            String            @id @default(cuid())
+  userId        String
+  university    String
+  program       String            @default("Doctor of Medicine")
+  cycleYear     Int
+  status        ApplicationStatus @default(RESEARCHING)
+  submittedAt   DateTime?         @db.Date
+  interviewDate DateTime?         @db.Date
+  interviewType String? // MMI, panel
+  outcome       String?
+  notes         String?
+  user          User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model EntryRequirement {
+  id       String  @id @default(cuid())
+  userId   String
+  title    String
+  detail   String?
+  met      Boolean @default(false)
+  order    Int     @default(0)
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ───────────────────────────── Roadmap ─────────────────────────────
+
+model LifeEvent {
+  id          String   @id @default(cuid())
+  userId      String
+  year        Int
+  title       String
+  description String?
+  category    String   @default("Personal")
+  done        Boolean  @default(false)
+  order       Int      @default(0)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, year])
+}
