@@ -3,6 +3,7 @@ import type { NextAuthConfig } from "next-auth";
 /** Edge-safe config (no Prisma / bcrypt) — shared by middleware and the full auth instance. */
 export default {
   pages: { signIn: "/login" },
+  trustHost: true,
   session: { strategy: "jwt", maxAge: 60 * 60 * 24 * 90 }, // 90-day persistent login
   providers: [],
   callbacks: {
